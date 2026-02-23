@@ -1,0 +1,685 @@
+#!/usr/bin/env python3
+"""
+    v2新增以下特性：
+    按 s 键：保存当前选区（不关闭窗口）
+    按 n 键：下一页
+    按 b 键：上一页
+    按 g 键：跳转到指定页（关闭窗口后在控制台输入页码）
+"""
+
+import os
+import sys
+import subprocess
+import tempfile
+import shutil
+import threading
+from pathlib import Path
+from tkinter import *
+from tkinter import ttk, filedialog, messagebox, simpledialog
+import warnings
+warnings.filterwarnings("ignore")
+
+# ------------------ 核心依赖检查和自动安装 ------------------
+def ensure_pip_package(module_name, package_name=None):
+    """检查并安装 Python 包"""
+    if package_name is None:
+        package_name = module_name
+    try:
+        __import__(module_name)
+        return True
+    except ImportError:
+        print(f"正在安装 {package_name}...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
+            __import__(module_name)
+            print(f"✅ {package_name} 安装成功")
+            return True
+        except Exception as e:
+            print(f"❌ 安装 {package_name} 失败: {e}")
+            return False
+
+# 必需 Python 包列表
+REQUIRED_PACKAGES = {
+    "PIL": "pillow",
+    "fitz": "PyMuPDF",
+    "pdfplumber": "pdfplumber",
+    "ebooklib": "ebooklib",
+    "bs4": "beautifulsoup4",
+    "matplotlib": "matplotlib",
+    "pytesseract": "pytesseract",
+    "pdf2image": "pdf2image",
+}
+
+for mod, pkg in REQUIRED_PACKAGES.items():
+    ensure_pip_package(mod, pkg)
+
+# ------------------ 外部工具检测 ------------------
+def find_tesseract():
+    """查找 tesseract.exe 路径"""
+    import shutil
+    path = shutil.which('tesseract')
+    if path:
+        return path
+    common = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+        os.path.expandvars(r"%USERPROFILE%\AppData\Local\Tesseract-OCR\tesseract.exe"),
+    ]
+    for p in common:
+        if os.path.exists(p):
+            return p
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Tesseract-OCR")
+        install_dir, _ = winreg.QueryValueEx(key, "InstallDir")
+        key.Close()
+        potential = os.path.join(install_dir, "tesseract.exe")
+        if os.path.exists(potential):
+            return potential
+    except:
+        pass
+    return None
+
+def setup_tesseract():
+    tesseract_path = find_tesseract()
+    if tesseract_path:
+        os.environ["PATH"] = os.path.dirname(tesseract_path) + os.pathsep + os.environ["PATH"]
+        import pytesseract
+        pytesseract.pytesseract.tesseract_cmd = tesseract_path
+        try:
+            version = pytesseract.get_tesseract_version()
+            print(f"✓ Tesseract 已找到: {tesseract_path} (版本 {version})")
+            return True
+        except Exception as e:
+            print(f"  Tesseract 加载失败: {e}")
+    print("❌ 未找到 Tesseract，OCR 功能将不可用。")
+    return False
+
+def check_poppler():
+    import shutil
+    if shutil.which('pdftoppm'):
+        print("✓ Poppler 已安装")
+        return True
+    common = [
+        r"C:\poppler\Library\bin",
+        r"C:\Program Files\poppler\bin",
+        r"C:\Program Files (x86)\poppler\bin",
+    ]
+    for path in common:
+        if os.path.exists(os.path.join(path, "pdftoppm.exe")):
+            os.environ["PATH"] = path + os.pathsep + os.environ["PATH"]
+            print(f"✓ Poppler 已找到: {path}")
+            return True
+    print("⚠ Poppler 未安装，将使用 PyMuPDF 备选方案")
+    return False
+
+def setup_pandoc():
+    import shutil
+    try:
+        import pypandoc
+        pypandoc.get_pandoc_version()
+        print("✓ Pandoc 已可用")
+        return True
+    except ImportError:
+        pass
+    except:
+        pass
+    if shutil.which('pandoc'):
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "pypandoc"])
+            import pypandoc
+            pypandoc.get_pandoc_version()
+            print("✓ Pandoc 已可用")
+            return True
+        except:
+            pass
+    print("正在安装 pypandoc_binary（内置 Pandoc）...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "pypandoc_binary"])
+        import pypandoc
+        pypandoc.get_pandoc_version()
+        print("✓ pypandoc_binary 安装成功")
+        return True
+    except Exception as e:
+        print(f"❌ 安装失败: {e}")
+        return False
+
+# ------------------ 工具函数 ------------------
+def ensure_dir(path):
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+def unique_filename(directory, base, ext):
+    counter = 1
+    name = f"{base}{ext}"
+    full = os.path.join(directory, name)
+    while os.path.exists(full):
+        name = f"{base}_{counter}{ext}"
+        full = os.path.join(directory, name)
+        counter += 1
+    return full
+
+# ------------------ 手动截图（优化版，支持拖拽平移、滚轮缩放、重置、跳转页、上一页/下一页） ------------------
+def manual_screenshot_pdf(pdf_path, output_dir, dpi=300):
+    """
+    手动在 PDF 页面上框选截图（基于 PyMuPDF 渲染，无需 poppler）
+    参数：
+        pdf_path : PDF 文件路径
+        output_dir : 截图保存目录
+        dpi : 渲染分辨率（越高越清晰，默认300）
+    """
+    import fitz
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    from matplotlib.widgets import RectangleSelector
+    import numpy as np
+    from PIL import Image
+    import io
+
+    ensure_dir(output_dir)
+    print(f"\n[手动截图] 目标文件夹: {output_dir}")
+    print(f"当前分辨率: {dpi} DPI")
+    print("操作说明：")
+    print("  - 鼠标滚轮：向前缩小，向后放大")
+    print("  - 按住 Ctrl + 鼠标左键拖拽：平移视图")
+    print("  - 按 r 键：重置视图到原始大小")
+    print("  - 按 s 键：保存当前选区（不关闭窗口）")
+    print("  - 按 n 键：下一页")
+    print("  - 按 b 键：上一页")
+    print("  - 按 g 键：跳转到指定页（关闭窗口后在控制台输入页码）")
+    print("  - 按 q 键：退出截图\n")
+
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        print(f"无法打开 PDF 文件: {e}")
+        return
+
+    total_pages = len(doc)
+    page_idx = 0
+    while 0 <= page_idx < total_pages:
+        print(f"\n--- 第 {page_idx+1} 页 / 共 {total_pages} 页 ---")
+        page = doc[page_idx]
+
+        # 渲染页面为 PIL Image
+        zoom = dpi / 72
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat)
+        img_data = pix.tobytes("png")
+        pil_img = Image.open(io.BytesIO(img_data))
+
+        img_array = np.array(pil_img)
+        fig, ax = plt.subplots(figsize=(15, 10))
+        ax.imshow(img_array)
+        ax.set_title(f"第 {page_idx+1} 页 - Ctrl+拖拽平移，滚轮缩放，r重置，s保存，n下一页，b上一页，g跳转，q退出")
+        plt.tight_layout()
+
+        # 存储原始坐标轴范围以便重置
+        initial_xlim = ax.get_xlim()
+        initial_ylim = ax.get_ylim()
+
+        coords = []          # 选区坐标
+        pan_start = [None]    # 平移起始点（用列表以便在嵌套函数中修改）
+        pan_active = [False]  # 是否正在平移
+
+        # 用于控制页面跳转
+        next_action = [None]  # 'next', 'prev', 'goto', 'quit'
+        target_page = [None]
+
+        # ---------- 矩形选择 ----------
+        def onselect(eclick, erelease):
+            x1, y1 = int(eclick.xdata), int(eclick.ydata)
+            x2, y2 = int(erelease.xdata), int(erelease.ydata)
+            coords.clear()
+            coords.append((min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)))
+            rect = patches.Rectangle(
+                (min(x1, x2), min(y1, y2)),
+                abs(x2 - x1), abs(y2 - y1),
+                linewidth=2, edgecolor='r', facecolor='none'
+            )
+            ax.add_patch(rect)
+            fig.canvas.draw()
+
+        rs = RectangleSelector(
+            ax, onselect, useblit=True,
+            button=[1], minspanx=5, minspany=5,
+            spancoords='pixels', interactive=True
+        )
+
+        # ---------- 鼠标滚轮缩放 ----------
+        def on_scroll(event):
+            scale_factor = 1.2 if event.button == 'up' else 0.8
+            xlim = ax.get_xlim()
+            ylim = ax.get_ylim()
+            xdata, ydata = event.xdata, event.ydata
+            if xdata is None or ydata is None:
+                return
+            new_width = (xlim[1] - xlim[0]) * scale_factor
+            new_height = (ylim[1] - ylim[0]) * scale_factor
+            ax.set_xlim([xdata - new_width/2, xdata + new_width/2])
+            ax.set_ylim([ydata - new_height/2, ydata + new_height/2])
+            fig.canvas.draw()
+
+        # ---------- 平移（Ctrl+左键拖拽）----------
+        def on_press(event):
+            if event.key == 'control' and event.button == 1:
+                pan_start[0] = (event.xdata, event.ydata)
+                pan_active[0] = True
+
+        def on_release(event):
+            pan_start[0] = None
+            pan_active[0] = False
+
+        def on_motion(event):
+            if not pan_active[0] or pan_start[0] is None or event.xdata is None or event.ydata is None:
+                return
+            dx = pan_start[0][0] - event.xdata
+            dy = pan_start[0][1] - event.ydata
+            xlim = ax.get_xlim()
+            ylim = ax.get_ylim()
+            ax.set_xlim([xlim[0] + dx, xlim[1] + dx])
+            ax.set_ylim([ylim[0] + dy, ylim[1] + dy])
+            pan_start[0] = (event.xdata, event.ydata)
+            fig.canvas.draw()
+
+        # ---------- 键盘事件 ----------
+        def on_key(event):
+            if event.key == 's':   # 保存截图
+                if coords:
+                    x1, y1, x2, y2 = coords[0]
+                    cropped = pil_img.crop((x1, y1, x2, y2))
+                    base_name = f"page{page_idx+1}_manual"
+                    out_path = unique_filename(output_dir, base_name, ".png")
+                    cropped.save(out_path)
+                    print(f"  ✓ 已保存截图: {os.path.basename(out_path)}")
+                # 不关闭窗口，可继续截图
+            elif event.key == 'n':
+                next_action[0] = 'next'
+                plt.close(fig)
+            elif event.key == 'b':
+                next_action[0] = 'prev'
+                plt.close(fig)
+            elif event.key == 'g':
+                next_action[0] = 'goto'
+                plt.close(fig)
+            elif event.key == 'q':
+                next_action[0] = 'quit'
+                plt.close('all')
+                doc.close()
+                sys.exit(0)
+            elif event.key == 'r':
+                # 重置视图
+                ax.set_xlim(initial_xlim)
+                ax.set_ylim(initial_ylim)
+                fig.canvas.draw()
+
+        # 连接事件
+        fig.canvas.mpl_connect('scroll_event', on_scroll)
+        fig.canvas.mpl_connect('button_press_event', on_press)
+        fig.canvas.mpl_connect('button_release_event', on_release)
+        fig.canvas.mpl_connect('motion_notify_event', on_motion)
+        fig.canvas.mpl_connect('key_press_event', on_key)
+
+        plt.show()
+
+        # 根据 next_action 更新 page_idx
+        if next_action[0] == 'next':
+            page_idx += 1
+        elif next_action[0] == 'prev':
+            page_idx -= 1
+        elif next_action[0] == 'goto':
+            # 提示用户输入页码
+            try:
+                inp = input(f"请输入页码 (1-{total_pages}): ").strip()
+                if inp:
+                    p = int(inp) - 1
+                    if 0 <= p < total_pages:
+                        page_idx = p
+                    else:
+                        print("页码超出范围，停留在当前页。")
+            except ValueError:
+                print("输入无效，停留在当前页。")
+        elif next_action[0] == 'quit':
+            break
+        else:
+            # 如果没有动作（例如直接关闭窗口），默认下一页
+            page_idx += 1
+
+    doc.close()
+    print(f"\n手动截图完成，图片保存在: {output_dir}")
+
+# ------------------ PDF文本提取（含OCR） ------------------
+def extract_text_from_pdf(pdf_path):
+    """提取PDF文本，自动判断是否OCR，返回纯文本内容（无页码标记）"""
+    try:
+        import pdfplumber
+        all_text = []
+        with pdfplumber.open(pdf_path) as pdf:
+            total = len(pdf.pages)
+            for i, page in enumerate(pdf.pages, 1):
+                txt = page.extract_text()
+                if txt:
+                    # 只添加文本，不加页码标记
+                    all_text.append(txt)
+                else:
+                    # 无文字页面，可以留空或加提示，但为避免干扰，不加任何内容
+                    pass
+        if all_text:
+            text = "\n\n".join(all_text)  # 页面间用两个换行分隔
+            # 如果文本很少且 Tesseract 可用，启用 OCR
+            if len(text.strip()) < total * 100 and TESSERACT_AVAILABLE:
+                return _ocr_pdf(pdf_path)
+            return text, total
+        else:
+            if TESSERACT_AVAILABLE:
+                return _ocr_pdf(pdf_path)
+            else:
+                return "", 0
+    except Exception as e:
+        print(f"pdfplumber提取失败: {e}")
+        if TESSERACT_AVAILABLE:
+            return _ocr_pdf(pdf_path)
+        else:
+            return "", 0
+
+def _ocr_pdf(pdf_path, lang='chi_sim+eng'):
+    """使用OCR识别PDF，返回纯文本内容（无页码标记）"""
+    import fitz
+    import pytesseract
+    from PIL import Image
+    import io
+    print("启用OCR识别...")
+    doc = fitz.open(pdf_path)
+    total = len(doc)
+    all_text = []
+    for i in range(total):
+        pix = doc[i].get_pixmap(dpi=200)
+        img = Image.open(io.BytesIO(pix.tobytes("ppm")))
+        txt = pytesseract.image_to_string(img, lang=lang)
+        all_text.append(txt)
+    doc.close()
+    return "\n\n".join(all_text), total
+
+# ------------------ EPUB文本提取 ------------------
+def extract_text_from_epub(epub_path):
+    """提取EPUB纯文本（无页码标记）"""
+    import ebooklib
+    from ebooklib import epub
+    from bs4 import BeautifulSoup
+
+    book = epub.read_epub(epub_path)
+    content = []
+    for item in book.get_items():
+        if item.get_type() == ebooklib.ITEM_DOCUMENT:
+            soup = BeautifulSoup(item.get_content(), 'html.parser')
+            for script in soup(["script", "style"]):
+                script.decompose()
+            text = soup.get_text()
+            lines = (line.strip() for line in text.splitlines())
+            text = '\n'.join(ln for ln in lines if ln)
+            if text:
+                content.append(text)
+    return '\n\n'.join(content), len(content)
+
+# ------------------ Pandoc 转换 ------------------
+def convert_with_pypandoc(input_file, output_file, from_format=None, to_format=None):
+    import pypandoc
+    fmt_map = {
+        'txt': 'plain',
+        'md': 'markdown',
+        'docx': 'docx',
+        'pdf': 'pdf',
+        'epub': 'epub',
+    }
+    if to_format in fmt_map:
+        to_format = fmt_map[to_format]
+    else:
+        ext = os.path.splitext(output_file)[1][1:]
+        to_format = fmt_map.get(ext, ext)
+    if from_format in ['txt', 'md', 'plain']:
+        from_format = 'markdown'
+    try:
+        pypandoc.convert_file(
+            source_file=input_file,
+            to=to_format,
+            format=from_format,
+            outputfile=output_file,
+            extra_args=[]
+        )
+        return True
+    except Exception as e:
+        print(f"pypandoc 转换错误: {e}")
+        return False
+
+# ------------------ 主转换函数 ------------------
+def convert_file(src_path, dst_format, output_dir=None, progress_callback=None):
+    src_path = Path(src_path)
+    if not src_path.exists():
+        raise FileNotFoundError(f"源文件不存在: {src_path}")
+    output_dir = Path(output_dir) if output_dir else src_path.parent
+    ensure_dir(output_dir)
+
+    base = src_path.stem
+    ext = src_path.suffix.lower()
+    temp_txt = None
+
+    try:
+        if ext == '.pdf':
+            if progress_callback:
+                progress_callback("正在提取PDF文本（可能启用OCR）...")
+            text, pages = extract_text_from_pdf(str(src_path))
+            if not text.strip():
+                raise Exception("未能提取到任何文本")
+            temp_txt = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
+            temp_txt.write(text)
+            temp_txt.close()
+            input_for_pandoc = temp_txt.name
+            from_fmt = 'markdown'
+        elif ext == '.epub':
+            if progress_callback:
+                progress_callback("正在提取EPUB文本...")
+            text, _ = extract_text_from_epub(str(src_path))
+            temp_txt = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
+            temp_txt.write(text)
+            temp_txt.close()
+            input_for_pandoc = temp_txt.name
+            from_fmt = 'markdown'
+        else:
+            raise ValueError(f"不支持的源文件格式: {ext}")
+
+        out_file = output_dir / f"{base}.{dst_format}"
+        counter = 1
+        while out_file.exists():
+            out_file = output_dir / f"{base}_{counter}.{dst_format}"
+            counter += 1
+
+        if dst_format in ['txt', 'md']:
+            shutil.copy2(input_for_pandoc, out_file)
+            if progress_callback:
+                progress_callback(f"转换完成：{out_file.name}")
+            return str(out_file)
+        else:
+            if not PANDOC_AVAILABLE:
+                raise Exception("需要 Pandoc 才能转换为该格式，但 Pandoc 不可用。")
+            if progress_callback:
+                progress_callback(f"正在调用 Pandoc 转换为 {dst_format}...")
+            success = convert_with_pypandoc(input_for_pandoc, str(out_file),
+                                            from_format=from_fmt, to_format=dst_format)
+            if success:
+                if progress_callback:
+                    progress_callback(f"转换完成：{out_file.name}")
+                return str(out_file)
+            else:
+                raise Exception("Pandoc 转换失败")
+    finally:
+        if temp_txt and os.path.exists(temp_txt.name):
+            os.unlink(temp_txt.name)
+
+# ------------------ GUI界面 ------------------
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("文档格式转换工具")
+        self.root.geometry("550x400")
+        self.root.resizable(False, False)
+
+        self.src_path = StringVar()
+        self.dst_format = StringVar(value="txt")
+        self.output_dir = StringVar(value=str(Path.cwd() / "output"))
+        self.status = StringVar(value="就绪")
+
+        self.create_widgets()
+
+        global TESSERACT_AVAILABLE, POPPLER_AVAILABLE, PANDOC_AVAILABLE
+        TESSERACT_AVAILABLE = setup_tesseract()
+        POPPLER_AVAILABLE = check_poppler()
+        PANDOC_AVAILABLE = setup_pandoc()
+        if not PANDOC_AVAILABLE:
+            messagebox.showwarning("提示", "Pandoc 未安装，部分格式转换将不可用。")
+
+    def create_widgets(self):
+        main_frame = ttk.Frame(self.root, padding="15")
+        main_frame.pack(fill=BOTH, expand=True)
+
+        # 源文件
+        ttk.Label(main_frame, text="源文件:").grid(row=0, column=0, sticky=W, pady=8)
+        ttk.Entry(main_frame, textvariable=self.src_path, width=45).grid(row=0, column=1, padx=5)
+        self.btn_browse_src = ttk.Button(main_frame, text="浏览...", command=self.browse_src)
+        self.btn_browse_src.grid(row=0, column=2)
+
+        # 目标格式
+        ttk.Label(main_frame, text="目标格式:").grid(row=1, column=0, sticky=W, pady=8)
+        formats = ['txt', 'md', 'docx', 'pdf', 'epub']
+        format_combo = ttk.Combobox(main_frame, textvariable=self.dst_format, values=formats, state="readonly", width=10)
+        format_combo.grid(row=1, column=1, sticky=W, padx=5)
+        ttk.Label(main_frame, text="(docx/pdf/epub 需要 Pandoc)").grid(row=1, column=1, columnspan=2, sticky=E, padx=5)
+
+        # 输出目录
+        ttk.Label(main_frame, text="输出目录:").grid(row=2, column=0, sticky=W, pady=8)
+        ttk.Entry(main_frame, textvariable=self.output_dir, width=45).grid(row=2, column=1, padx=5)
+        self.btn_browse_out = ttk.Button(main_frame, text="浏览...", command=self.browse_output)
+        self.btn_browse_out.grid(row=2, column=2)
+
+        # 转换按钮
+        self.btn_convert = ttk.Button(main_frame, text="开始转换", command=self.start_conversion)
+        self.btn_convert.grid(row=3, column=0, columnspan=3, pady=15)
+
+        # 状态显示
+        ttk.Label(main_frame, text="状态:").grid(row=4, column=0, sticky=W, pady=8)
+        ttk.Label(main_frame, textvariable=self.status, foreground="blue").grid(row=4, column=1, columnspan=2, sticky=W)
+
+        # 进度条
+        self.progress = ttk.Progressbar(main_frame, mode='indeterminate')
+        self.progress.grid(row=5, column=0, columnspan=3, sticky=EW, pady=10)
+
+        # 分隔线
+        ttk.Separator(main_frame, orient=HORIZONTAL).grid(row=6, column=0, columnspan=3, sticky=EW, pady=10)
+
+        # 底部按钮
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.grid(row=7, column=0, columnspan=3, pady=5)
+        self.btn_manual = ttk.Button(btn_frame, text="📷 手动截图PDF", command=self.manual_crop)
+        self.btn_manual.pack(side=LEFT, padx=10)
+        self.btn_quit = ttk.Button(btn_frame, text="❌ 退出", command=self.root.quit)
+        self.btn_quit.pack(side=LEFT, padx=10)
+
+    def browse_src(self):
+        filetypes = [("PDF文件", "*.pdf"), ("EPUB文件", "*.epub"), ("所有文件", "*.*")]
+        path = filedialog.askopenfilename(title="选择源文件", filetypes=filetypes)
+        if path:
+            self.src_path.set(path)
+
+    def browse_output(self):
+        path = filedialog.askdirectory(title="选择输出目录")
+        if path:
+            self.output_dir.set(path)
+
+    def _set_buttons_state(self, state):
+        """转换过程中禁用按钮，转换后恢复"""
+        self.btn_convert.config(state=state)
+        self.btn_browse_src.config(state=state)
+        self.btn_browse_out.config(state=state)
+        self.btn_manual.config(state=state)
+
+    def start_conversion(self):
+        src = self.src_path.get().strip()
+        if not src:
+            messagebox.showerror("错误", "请选择源文件")
+            return
+        dst_fmt = self.dst_format.get()
+        out_dir = self.output_dir.get().strip()
+        if not out_dir:
+            out_dir = str(Path.cwd() / "output")
+            self.output_dir.set(out_dir)
+
+        need_pandoc = dst_fmt in ['docx', 'pdf', 'epub']
+        if need_pandoc and not PANDOC_AVAILABLE:
+            messagebox.showerror("错误", "转换到该格式需要 Pandoc，但当前不可用。")
+            return
+
+        self._set_buttons_state(DISABLED)
+        self.progress.start()
+        self.status.set("正在转换...")
+        thread = threading.Thread(target=self._convert_thread, args=(src, dst_fmt, out_dir))
+        thread.daemon = True
+        thread.start()
+
+    def _convert_thread(self, src, dst_fmt, out_dir):
+        try:
+            def update_status(msg):
+                self.root.after(0, lambda: self.status.set(msg))
+
+            out_file = convert_file(src, dst_fmt, out_dir, progress_callback=update_status)
+            self.root.after(0, lambda: self._conversion_done(True, out_file))
+        except Exception as e:
+            err_msg = str(e)
+            self.root.after(0, lambda: self._conversion_done(False, err_msg))
+
+    def _conversion_done(self, success, result):
+        self.progress.stop()
+        self._set_buttons_state(NORMAL)
+        if success:
+            self.status.set("就绪")
+            messagebox.showinfo("完成", f"文件已保存至：\n{result}")
+            # 清空源文件路径，方便下一个文件
+            self.src_path.set("")
+            # 焦点回到浏览按钮
+            self.btn_browse_src.focus_set()
+        else:
+            self.status.set("转换失败")
+            messagebox.showerror("错误", f"转换失败：{result}")
+
+    def manual_crop(self):
+        path = filedialog.askopenfilename(title="选择PDF文件", filetypes=[("PDF", "*.pdf")])
+        if not path:
+            return
+        out_dir = filedialog.askdirectory(title="选择截图保存目录")
+        if not out_dir:
+            out_dir = str(Path(path).parent / "manual_crops")
+        # 询问用户 DPI（可选，默认300）
+        dpi_str = simpledialog.askstring("截图分辨率", "请输入DPI值（越高越清晰，默认300）", initialvalue="300")
+        try:
+            dpi = int(dpi_str) if dpi_str else 300
+        except ValueError:
+            dpi = 300
+        # 调用优化后的手动截图函数
+        thread = threading.Thread(target=manual_screenshot_pdf, args=(path, out_dir, dpi))
+        thread.daemon = True
+        thread.start()
+        self.status.set("手动截图已启动，请查看图像窗口...")
+
+# ------------------ 全局变量 ------------------
+TESSERACT_AVAILABLE = False
+POPPLER_AVAILABLE = False
+PANDOC_AVAILABLE = False
+
+def main():
+    print("="*60)
+    print("文档格式转换工具 - 启动中...")
+    print("="*60)
+    root = Tk()
+    app = App(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()

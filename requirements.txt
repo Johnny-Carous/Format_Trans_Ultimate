@@ -1,0 +1,11 @@
+customtkinter
+pillow
+PyMuPDF
+pdfplumber
+ebooklib
+beautifulsoup4
+matplotlib
+pytesseract
+pdf2image
+pypandoc_binary
+numpy
